@@ -1,0 +1,68 @@
+{
+  "test_timestamp": 1756995893.133894,
+  "system_info": {
+    "cpu_count": 8,
+    "memory_total_gb": 8.0,
+    "python_version": "3.13.7 (main, Aug 14 2025, 11:12:11) [Clang 17.0.0 (clang-1700.0.13.3)]"
+  },
+  "tests": {
+    "memory_monitor": true,
+    "model_manager": {
+      "success": true,
+      "profiler_data": {
+        "total_measurements": 2,
+        "measurements": [
+          {
+            "label": "Whisper Model Loading",
+            "start_time": 1756995893.302206,
+            "initial_memory": 78.296875,
+            "peak_memory": 652.65625,
+            "memory_samples": [
+              78.296875,
+              652.65625,
+              322.671875
+            ],
+            "end_time": 1756995897.341707,
+            "duration": 4.039500951766968,
+            "final_memory": 323.15625
+          },
+          {
+            "label": "Sentiment Analyzer Loading",
+            "start_time": 1756995897.3417711,
+            "initial_memory": 323.1875,
+            "peak_memory": 435.40625,
+            "memory_samples": [
+              323.1875,
+              310.9375,
+              435.40625
+            ],
+            "end_time": 1756995902.2704298,
+            "duration": 4.928658723831177,
+            "final_memory": 435.421875
+          }
+        ]
+      }
+    },
+    "transcription": {
+      "success": true,
+      "profiler_data": {
+        "total_measurements": 1,
+        "measurements": [
+          {
+            "label": "Streaming Transcription",
+            "start_time": 1756995902.4004102,
+            "initial_memory": 443.578125,
+            "peak_memory": 836.59375,
+            "memory_samples": [
+              443.578125,
+              836.59375
+            ],
+            "end_time": 1756995904.252578,
+            "duration": 1.8521678447723389,
+            "final_memory": 836.59375
+          }
+        ]
+      }
+    }
+  }
+}

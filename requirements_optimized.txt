@@ -1,0 +1,26 @@
+# Requirements ottimizzati per Mac M1
+# Versioni specifiche per stabilità e performance
+
+# Core dependencies
+yt-dlp>=2023.12.30
+faster-whisper>=0.10.0
+transformers>=4.36.0
+torch>=2.1.0
+numpy>=1.24.0
+soundfile>=0.12.1
+
+# System monitoring
+psutil>=5.9.0
+
+# GUI (già incluso in Python)
+# tkinter - built-in
+
+# Dipendenze opzionali per performance Mac M1
+# Uncomment se disponibili:
+# accelerate>=0.25.0  # Per ottimizzazioni Hugging Face
+# optimum>=1.16.0     # Per ottimizzazioni modelli
+
+# Note per installazione Mac M1:
+# 1. Installa prima ffmpeg: brew install ffmpeg
+# 2. Per torch ottimizzato: pip install torch torchvision torchaudio
+# 3. Se problemi con faster-whisper: pip install --upgrade faster-whisper
