@@ -1,16 +1,15 @@
 #!/usr/bin/env python3
 """
-Viral Reels Generator - Optimized for Mac M1
-Implemented optimizations:
-- Lazy loading of AI models
-- Improved memory management with context managers
-- Streaming processing for large videos
-- Explicit garbage collection
-- Integrated memory monitoring
-- Asynchronous processing for responsive UI
+Viral Reels
+Advanced features:
+- Intelligent sentence-based video cuts
+- Dynamic word-by-word subtitle highlighting
+- OpusClip-style reel generation
+- Perfect sync between audio and subtitles
+- TikTok-optimized 9:16 format
 """
 
-import os, tempfile, subprocess, re, threading, gc, psutil
+import os, tempfile, subprocess, re, threading, gc, psutil, json, hashlib
 from pathlib import Path
 from collections import namedtuple
 from contextlib import contextmanager
@@ -19,13 +18,28 @@ from tkinter import ttk, filedialog
 import yt_dlp
 import numpy as np
 from typing import List, Dict, Optional, Generator
+import nltk
+from nltk.tokenize import sent_tokenize
+import string
+
+# Download required NLTK data
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt')
 
 # Optimizations for Mac M1
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-os.environ["OMP_NUM_THREADS"] = "4"  # Limit threads to avoid saturation
+os.environ["OMP_NUM_THREADS"] = "4"
 os.environ["MKL_NUM_THREADS"] = "4"
 
-Block = namedtuple("Block", "start end text score")
+# Data structures
+Block = namedtuple("Block", "start end text score words")
+Word = namedtuple("Word", "text start end")
+Sentence = namedtuple("Sentence", "text start end words score")
+
+CACHE_DIR = Path("cache")
+CACHE_DIR.mkdir(exist_ok=True)
 
 class MemoryMonitor:
     """Memory monitor to prevent RAM saturation"""
@@ -46,7 +60,6 @@ class MemoryMonitor:
     def force_cleanup():
         """Force garbage collection and cleanup"""
         gc.collect()
-        # Force numpy cleanup
         if 'numpy' in globals():
             np.random.seed()
 
@@ -83,7 +96,7 @@ class ModelManager:
                 self.sentiment_analyzer = pipeline(
                     "sentiment-analysis",
                     model="nlptown/bert-base-multilingual-uncased-sentiment",
-                    device=-1  # CPU
+                    device=-1
                 )
             yield self.sentiment_analyzer
     
@@ -101,15 +114,33 @@ class ModelManager:
         
         MemoryMonitor.force_cleanup()
 
-def transcribe_with_streaming(video_path: str, chunk_duration: int = 30) -> List[Dict]:
-    """Transcribe video with streaming processing to manage memory"""
-    print(f"🎵 Streaming transcription of: {Path(video_path).name}")
+def get_video_id(url: str) -> str:
+    """Extract video ID from YouTube URL"""
+    patterns = [
+        r"v=([a-zA-Z0-9_-]+)",
+        r"youtu\.be/([a-zA-Z0-9_-]+)",
+        r"embed/([a-zA-Z0-9_-]+)"
+    ]
     
-    # Extract audio
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    
+    # Fallback to hash of URL
+    return hashlib.md5(url.encode()).hexdigest()[:12]
+
+def transcribe_with_word_timestamps(video_path: str) -> List[Dict]:
+    """Transcribe video with word-level timestamps"""
+    print(f"🎵 Transcribing with word timestamps: {Path(video_path).name}")
+    
     with tempfile.NamedTemporaryFile(suffix=".wav") as tmp_audio:
+        # Extract audio with better quality for word-level accuracy
         cmd = [
             "ffmpeg", "-y", "-i", video_path,
-            "-ar", "16000", "-ac", "1", "-vn", tmp_audio.name
+            "-ar", "16000", "-ac", "1", "-vn", 
+            "-af", "highpass=f=200,lowpass=f=3000",  # Audio filtering for better speech clarity
+            tmp_audio.name
         ]
         
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -117,206 +148,349 @@ def transcribe_with_streaming(video_path: str, chunk_duration: int = 30) -> List
             print(f"❌ Audio extraction failed: {result.stderr}")
             return []
         
-        # Process in chunks
-        duration = get_audio_duration(tmp_audio.name)
         segments = []
-        
         manager = ModelManager()
+        
         with manager.get_whisper_model() as model:
-            for start in range(0, int(duration), chunk_duration):
-                end = min(start + chunk_duration, duration)
-                print(f"🎵 Processing audio chunk {start}-{end}s...")
-                
-                chunk_segments = transcribe_audio_chunk(
-                    model, tmp_audio.name, start, end
+            try:
+                segments_result, _ = model.transcribe(
+                    tmp_audio.name,
+                    beam_size=5,
+                    word_timestamps=True,
+                    condition_on_previous_text=False,
+                    temperature=0.0
                 )
-                segments.extend(chunk_segments)
                 
-                # Check memory
-                if MemoryMonitor.check_memory_limit():
-                    print("⚠️ Memory limit reached, stopping transcription")
-                    break
+                for segment in segments_result:
+                    words = []
+                    if hasattr(segment, 'words') and segment.words:
+                        for word in segment.words:
+                            words.append({
+                                'text': word.word.strip(),
+                                'start': word.start,
+                                'end': word.end
+                            })
+                    else:
+                        # Fallback: estimate word timings
+                        text_words = segment.text.strip().split()
+                        word_duration = (segment.end - segment.start) / len(text_words) if text_words else 0
+                        
+                        for i, word_text in enumerate(text_words):
+                            word_start = segment.start + i * word_duration
+                            word_end = word_start + word_duration
+                            words.append({
+                                'text': word_text,
+                                'start': word_start,
+                                'end': word_end
+                            })
+                    
+                    segments.append({
+                        'start': segment.start,
+                        'end': segment.end,
+                        'text': segment.text.strip(),
+                        'words': words
+                    })
+                    
+            except Exception as e:
+                print(f"❌ Transcription error: {e}")
         
         manager.cleanup_all()
         return segments
 
-def get_audio_duration(audio_path: str) -> float:
-    """Get audio duration in seconds"""
-    cmd = ["ffprobe", "-v", "quiet", "-show_entries", "format=duration", 
-           "-of", "csv=p=0", audio_path]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    return float(result.stdout.strip()) if result.stdout.strip() else 0
-
-def transcribe_audio_chunk(model, audio_path: str, start: int, end: int) -> List[Dict]:
-    """Transcribe a specific chunk of audio"""
-    with tempfile.NamedTemporaryFile(suffix=".wav") as tmp_chunk:
-        cmd = [
-            "ffmpeg", "-y", "-ss", str(start), "-t", str(end-start),
-            "-i", audio_path, "-ar", "16000", "-ac", "1", tmp_chunk.name
-        ]
-        
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        if result.returncode != 0:
-            print(f"❌ Audio chunk extraction failed: {result.stderr}")
-            return []
-        
-        # Transcribe chunk
-        segments = []
-        try:
-            segments_result, _ = model.transcribe(
-                tmp_chunk.name, 
-                beam_size=5,
-                word_timestamps=True
-            )
-            
-            for segment in segments_result:
-                segments.append({
-                    'start': segment.start + start,
-                    'end': segment.end + start,
-                    'text': segment.text.strip()
-                })
-        except Exception as e:
-            print(f"❌ Transcription error: {e}")
-        
-        return segments
-
-def score_segments(segments: List[Dict], analyzer) -> List[Block]:
-    """Score segments based on sentiment and other factors"""
-    if not segments:
-        return []
+def segment_into_sentences(transcription_segments: List[Dict]) -> List[Sentence]:
+    """Segment transcription into meaningful sentences"""
+    print("📝 Segmenting into sentences...")
     
-    blocks = []
-    for segment in segments:
-        if not segment['text'].strip():
+    # Combine all text and create a mapping
+    full_text = ""
+    word_mapping = []  # Maps character position to word info
+    
+    for segment in transcription_segments:
+        for word_info in segment['words']:
+            word_text = word_info['text']
+            start_pos = len(full_text)
+            full_text += word_text + " "
+            end_pos = len(full_text) - 1
+            
+            word_mapping.append({
+                'text': word_text,
+                'start': word_info['start'],
+                'end': word_info['end'],
+                'char_start': start_pos,
+                'char_end': end_pos
+            })
+    
+    # Split into sentences
+    sentences = sent_tokenize(full_text.strip())
+    sentence_objects = []
+    
+    char_pos = 0
+    for sentence_text in sentences:
+        sentence_text = sentence_text.strip()
+        if not sentence_text:
             continue
             
-        # Analyze sentiment
-        try:
-            result = analyzer(segment['text'])
-            # Extract star rating (1-5 stars)
-            label = result[0]['label']
-            score = int(label.split()[0]) / 5.0  # Convert to 0-1 scale
-        except:
-            score = 0.5  # Default neutral score
+        # Find sentence position in full text
+        sentence_start_char = full_text.find(sentence_text, char_pos)
+        if sentence_start_char == -1:
+            continue
+            
+        sentence_end_char = sentence_start_char + len(sentence_text)
+        char_pos = sentence_end_char
         
-        blocks.append(Block(
-            start=segment['start'],
-            end=segment['end'],
-            text=segment['text'],
-            score=score
-        ))
+        # Find words that belong to this sentence
+        sentence_words = []
+        sentence_start_time = None
+        sentence_end_time = None
+        
+        for word_info in word_mapping:
+            word_start_char = word_info['char_start']
+            word_end_char = word_info['char_end']
+            
+            # Check if word overlaps with sentence
+            if (word_start_char >= sentence_start_char and word_start_char <= sentence_end_char) or \
+               (word_end_char >= sentence_start_char and word_end_char <= sentence_end_char):
+                
+                sentence_words.append(Word(
+                    text=word_info['text'],
+                    start=word_info['start'],
+                    end=word_info['end']
+                ))
+                
+                if sentence_start_time is None:
+                    sentence_start_time = word_info['start']
+                sentence_end_time = word_info['end']
+        
+        if sentence_words and sentence_start_time is not None:
+            # Calculate engagement score
+            score = calculate_sentence_score(sentence_text, sentence_words)
+            
+            sentence_objects.append(Sentence(
+                text=sentence_text,
+                start=sentence_start_time,
+                end=sentence_end_time,
+                words=sentence_words,
+                score=score
+            ))
     
-    return blocks
+    print(f"✅ Created {len(sentence_objects)} sentences")
+    return sentence_objects
 
-def select_best_segments(blocks: List[Block], max_duration: int, 
-                        max_clips: int) -> List[Block]:
-    """Select best segments based on scores and constraints"""
-    if not blocks:
+def calculate_sentence_score(text: str, words: List[Word]) -> float:
+    """Calculate engagement score for a sentence"""
+    score = 0.5  # Base score
+    
+    # Length factor (prefer medium-length sentences)
+    word_count = len(words)
+    if 5 <= word_count <= 15:
+        score += 0.2
+    elif word_count > 20:
+        score -= 0.1
+    
+    # Excitement indicators
+    excitement_words = [
+        'amazing', 'incredible', 'wow', 'unbelievable', 'fantastic', 
+        'awesome', 'shocking', 'surprising', 'crazy', 'insane'
+    ]
+    
+    text_lower = text.lower()
+    for word in excitement_words:
+        if word in text_lower:
+            score += 0.15
+    
+    # Question or exclamation
+    if text.endswith('?') or text.endswith('!'):
+        score += 0.1
+    
+    # Numbers and facts
+    if re.search(r'\d+', text):
+        score += 0.1
+    
+    # Action words
+    action_words = ['show', 'see', 'look', 'watch', 'check', 'discover', 'learn']
+    for word in action_words:
+        if word in text_lower:
+            score += 0.05
+    
+    return min(score, 1.0)  # Cap at 1.0
+
+def select_best_sentences(sentences: List[Sentence], max_duration: int, max_clips: int) -> List[Sentence]:
+    """Select best sentences for reel creation"""
+    if not sentences:
         return []
     
     # Sort by score (descending)
-    sorted_blocks = sorted(blocks, key=lambda x: x.score, reverse=True)
+    sorted_sentences = sorted(sentences, key=lambda x: x.score, reverse=True)
     
     selected = []
-    total_duration = 0
     
-    for block in sorted_blocks:
+    for sentence in sorted_sentences:
         if len(selected) >= max_clips:
             break
-            
-        block_duration = block.end - block.start
-        if total_duration + block_duration <= max_duration:
-            selected.append(block)
-            total_duration += block_duration
+        
+        sentence_duration = sentence.end - sentence.start
+        
+        # Filter sentences that are too short or too long
+        if sentence_duration < 2 or sentence_duration > max_duration:
+            continue
+        
+        # Avoid sentences that are too close to already selected ones
+        too_close = False
+        for selected_sentence in selected:
+            time_gap = min(
+                abs(sentence.start - selected_sentence.end),
+                abs(selected_sentence.start - sentence.end)
+            )
+            if time_gap < 5:  # At least 5 seconds apart
+                too_close = True
+                break
+        
+        if not too_close:
+            selected.append(sentence)
     
-    # Sort by time for sequential output
+    # Sort by time for sequential processing
     return sorted(selected, key=lambda x: x.start)
 
-def add_subtitles_to_video(input_video: str, blocks: List[Block],
-                          output_video: str):
-    """Add subtitles to video using ffmpeg"""
-    print(f"📝 Adding subtitles to: {Path(output_video).name}")
-
-    # Create ASS subtitle file with improved styling
-    with tempfile.NamedTemporaryFile(suffix=".ass", mode='w',
-                                    encoding='utf-8', delete=False) as f:
-        ass_file = f.name
+def create_word_level_subtitles(sentence: Sentence, output_path: str):
+    """Create ASS subtitle file with word-level highlighting"""
+    
+    with open(output_path, 'w', encoding='utf-8') as f:
         f.write("""[Script Info]
-Title: Viral Reels Subtitles
-ScriptType: v2.00
+Title: OpusClip Style Subtitles
+ScriptType: v4.00+
 WrapStyle: 0
 ScaledBorderAndShadow: yes
 YCbCr Matrix: TV.601
 
 [V4+ Styles]
 Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
-Style: Default,Courier New,14,&H0000FF00,&H000000FF,&H80000000,&H80000000,-1,0,0,0,100,100,0,0,1,2,1,2,10,10,100,1
+Style: Default,Courier New,28,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,-1,0,0,0,100,100,0,0,1,3,0,2,30,30,150,1
 
 [Events]
 Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
 """)
+        
+        words = sentence.words
+        if not words:
+            return
+        
+        # Adjust word timings relative to sentence start
+        sentence_start = sentence.start
+        
+        for i, word in enumerate(words):
+            word_start = word.start - sentence_start
+            word_end = word.end - sentence_start
+            
+            # Create the subtitle line with current word highlighted
+            subtitle_parts = []
+            
+            for j, w in enumerate(words):
+                if j == i:
+                    # Highlight current word in green
+                    subtitle_parts.append(f"{{\\c&H00FF00&}}{w.text}{{\\c&HFFFFFF&}}")
+                else:
+                    # Regular white text
+                    subtitle_parts.append(w.text)
+            
+            subtitle_text = " ".join(subtitle_parts)
+            
+            # Escape special characters
+            subtitle_text = subtitle_text.replace("\\", "\\\\").replace("{", "\\{").replace("}", "\\}")
+            
+            start_time = format_ass_time(max(0, word_start))
+            end_time = format_ass_time(word_end)
+            
+            f.write(f"Dialogue: 0,{start_time},{end_time},Default,,0,0,0,,{subtitle_text}\n")
 
-        for i, block in enumerate(blocks):
-            start_time = format_timestamp(block.start)
-            end_time = format_timestamp(block.end)
-            # Escape special characters and highlight words
-            text = block.text.replace("'", "''").replace('"', '""')
-            # Highlight the entire text in green (you can modify this to highlight specific words)
-            highlighted_text = f"{{\\c&H00FF00&}}{text}"
-            f.write(f"Dialogue: 0,{start_time},{end_time},Default,,0,0,0,,{highlighted_text}\n")
-
-    # Add subtitles to video with better positioning
-    cmd = [
-        "ffmpeg", "-y", "-i", input_video,
-        "-vf", f"subtitles={ass_file}:force_style='Fontname=Courier New,Bold=1,Fontsize=14,PrimaryColour=&H00FF00&,Outline=2,Shadow=1,Alignment=2,MarginV=100'",
-        "-c:a", "copy", output_video
-    ]
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"❌ Subtitle addition failed: {result.stderr}")
-
-    # Cleanup
-    try:
-        os.unlink(ass_file)
-    except:
-        pass
-
-def format_timestamp(seconds: float) -> str:
-    """Format seconds to HH:MM:SS.mmm"""
+def format_ass_time(seconds: float) -> str:
+    """Format seconds to ASS time format (H:MM:SS.cc)"""
     hours = int(seconds // 3600)
     minutes = int((seconds % 3600) // 60)
     secs = seconds % 60
-    return f"{hours:01d}:{minutes:02d}:{secs:06.3f}"
+    return f"{hours}:{minutes:02d}:{secs:05.2f}"
 
-def create_vertical_video(input_video: str, output_video: str):
-    """Convert video to 9:16 vertical format (1080x1920)"""
-    print(f"📱 Converting to vertical format: {Path(output_video).name}")
-    
-    cmd = [
-        "ffmpeg", "-y", "-i", input_video,
-        "-vf", "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2,setsar=1",
-        "-c:v", "libx264", "-preset", "medium", "-crf", "23",
-        "-c:a", "aac", "-b:a", "128k",
-        output_video
+def create_reel_from_sentence(video_path: str, sentence: Sentence, output_path: str, temp_dir: Path, logger=None):
+    """Create a single reel from a sentence"""
+
+    def log_message(msg):
+        if logger:
+            logger(msg)
+        else:
+            print(msg)
+
+    # Step 1: Extract video segment
+    segment_file = temp_dir / "segment.mp4"
+
+    # Add small padding to ensure we don't cut mid-word
+    padding = 0.2
+    start_time = max(0, sentence.start - padding)
+    duration = sentence.end - sentence.start + (2 * padding)
+
+    cmd_extract = [
+        "ffmpeg", "-y", "-ss", str(start_time), "-t", str(duration),
+        "-i", str(video_path), "-c:v", "libx264", "-c:a", "aac",
+        "-avoid_negative_ts", "make_zero", str(segment_file)
     ]
-    
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    if result.returncode != 0:
-        print(f"❌ Vertical conversion failed: {result.stderr}")
 
-class OptimizedApp:
+    log_message(f"🎬 Extracting video segment: {start_time:.2f}s to {start_time + duration:.2f}s")
+    result = subprocess.run(cmd_extract, capture_output=True, text=True)
+    if result.returncode != 0:
+        log_message(f"❌ Segment extraction failed: {result.stderr}")
+        return False
+
+    # Step 2: Create word-level subtitles
+    subtitle_file = temp_dir / "subtitles.ass"
+    create_word_level_subtitles(sentence, str(subtitle_file))
+    log_message(f"📝 Created subtitles with {len(sentence.words)} words")
+
+    # Step 3: Apply subtitles to video
+    subtitled_file = temp_dir / "subtitled.mp4"
+
+    cmd_subtitle = [
+        "ffmpeg", "-y", "-i", str(segment_file), "-vf",
+        f"ass={subtitle_file}",
+        "-c:a", "copy", str(subtitled_file)
+    ]
+
+    log_message(f"📝 Applying subtitles to video")
+    result = subprocess.run(cmd_subtitle, capture_output=True, text=True)
+    if result.returncode != 0:
+        log_message(f"❌ Subtitle application failed: {result.stderr}")
+        return False
+
+    # Step 4: Convert to TikTok format (9:16)
+    cmd_format = [
+        "ffmpeg", "-y", "-i", str(subtitled_file),
+        "-vf",
+        "scale=1080:1920:force_original_aspect_ratio=decrease,pad=1080:1920:(ow-iw)/2:(oh-ih)/2:black,setsar=1",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "23",
+        "-c:a", "aac", "-b:a", "128k", "-ar", "44100",
+        str(output_path)
+    ]
+
+    log_message(f"🎥 Converting to TikTok format (9:16)")
+    result = subprocess.run(cmd_format, capture_output=True, text=True)
+    if result.returncode != 0:
+        log_message(f"❌ Format conversion failed: {result.stderr}")
+        return False
+
+    log_message(f"✅ Successfully created reel: {Path(output_path).name}")
+    return True
+
+class OpusClipApp:
     """Main GUI application"""
     
     def __init__(self, root):
         self.root = root
-        self.root.title("🎬 Viral Reels Generator - Mac M1 Optimized")
-        self.root.geometry("600x500")
+        self.root.title("🎬 Viral Reels")
+        self.root.geometry("650x600")
         self.root.resizable(True, True)
-        
+
         # Processing state
         self.is_processing = False
-        
+        self.generation_success = False
+        self.generated_count = 0
+
         self.setup_ui()
     
     def setup_ui(self):
@@ -333,70 +507,100 @@ class OptimizedApp:
         # Title
         title_label = ttk.Label(
             main_frame, 
-            text="🎬 Viral Reels Generator", 
-            font=('Arial', 16, 'bold')
+            text="🎬 OpusClip Style Reels Generator", 
+            font=('Arial', 18, 'bold')
         )
-        title_label.grid(row=0, column=0, columnspan=3, pady=(0, 20))
+        title_label.grid(row=0, column=0, columnspan=3, pady=(0, 25))
+        
+        # Description
+        desc_label = ttk.Label(
+            main_frame,
+            text="Generate viral reels with intelligent cuts and dynamic subtitles",
+            font=('Arial', 10),
+            foreground='gray'
+        )
+        desc_label.grid(row=1, column=0, columnspan=3, pady=(0, 20))
         
         # URL input
-        ttk.Label(main_frame, text="YouTube URL:").grid(
-            row=1, column=0, sticky=tk.W, pady=5
+        ttk.Label(main_frame, text="YouTube URL:", font=('Arial', 11, 'bold')).grid(
+            row=2, column=0, sticky=tk.W, pady=8
         )
         self.url_var = tk.StringVar()
-        self.url_entry = ttk.Entry(main_frame, textvariable=self.url_var, width=50)
-        self.url_entry.grid(row=1, column=1, columnspan=2, sticky=(tk.W, tk.E), pady=5)
+        self.url_entry = ttk.Entry(main_frame, textvariable=self.url_var, width=55, font=('Arial', 10))
+        self.url_entry.grid(row=2, column=1, columnspan=2, sticky=(tk.W, tk.E), pady=8)
         
         # Duration
-        ttk.Label(main_frame, text="Max Clip Duration (seconds):").grid(
-            row=2, column=0, sticky=tk.W, pady=5
+        ttk.Label(main_frame, text="Max Reel Duration (seconds):", font=('Arial', 11, 'bold')).grid(
+            row=3, column=0, sticky=tk.W, pady=8
         )
-        self.duration_var = tk.StringVar(value="45")
-        duration_entry = ttk.Entry(main_frame, textvariable=self.duration_var, width=10)
-        duration_entry.grid(row=2, column=1, sticky=tk.W, pady=5)
+        self.duration_var = tk.StringVar(value="60")
+        duration_entry = ttk.Entry(main_frame, textvariable=self.duration_var, width=15, font=('Arial', 10))
+        duration_entry.grid(row=3, column=1, sticky=tk.W, pady=8)
         
         # Number of clips
-        ttk.Label(main_frame, text="Number of Reels:").grid(
-            row=3, column=0, sticky=tk.W, pady=5
+        ttk.Label(main_frame, text="Number of Reels:", font=('Arial', 11, 'bold')).grid(
+            row=4, column=0, sticky=tk.W, pady=8
         )
-        self.clips_var = tk.StringVar(value="3")
-        clips_entry = ttk.Entry(main_frame, textvariable=self.clips_var, width=10)
-        clips_entry.grid(row=3, column=1, sticky=tk.W, pady=5)
+        self.clips_var = tk.StringVar(value="5")
+        clips_entry = ttk.Entry(main_frame, textvariable=self.clips_var, width=15, font=('Arial', 10))
+        clips_entry.grid(row=4, column=1, sticky=tk.W, pady=8)
         
         # Output folder
-        ttk.Label(main_frame, text="Output Folder:").grid(
-            row=4, column=0, sticky=tk.W, pady=5
+        ttk.Label(main_frame, text="Output Folder:", font=('Arial', 11, 'bold')).grid(
+            row=5, column=0, sticky=tk.W, pady=8
         )
-        self.output_var = tk.StringVar(value=str(Path.home() / "Desktop" / "ViralReels"))
-        output_entry = ttk.Entry(main_frame, textvariable=self.output_var, width=50)
-        output_entry.grid(row=4, column=1, sticky=(tk.W, tk.E), pady=5)
+        self.output_var = tk.StringVar(value=str(Path.home() / "Desktop" / "OpusClip_Reels"))
+        output_entry = ttk.Entry(main_frame, textvariable=self.output_var, width=55, font=('Arial', 10))
+        output_entry.grid(row=5, column=1, sticky=(tk.W, tk.E), pady=8)
         ttk.Button(main_frame, text="Browse", command=self.browse_output).grid(
-            row=4, column=2, padx=(5, 0), pady=5
+            row=5, column=2, padx=(8, 0), pady=8
         )
         
         # Generate button
         self.generate_btn = ttk.Button(
             main_frame, 
-            text="🚀 GENERATE REELS", 
-            command=self.start_generation
+            text="🚀 GENERATE OPUSCLIP REELS", 
+            command=self.start_generation,
+            style="Accent.TButton"
         )
-        self.generate_btn.grid(row=5, column=0, columnspan=3, pady=20)
+        self.generate_btn.grid(row=6, column=0, columnspan=3, pady=25)
         
-        # Progress bar
+        # Progress bar for overall process
+        ttk.Label(main_frame, text="Overall Progress:", font=('Arial', 10, 'bold')).grid(
+            row=7, column=0, sticky=tk.W, pady=(15, 5)
+        )
         self.progress = ttk.Progressbar(main_frame, mode='indeterminate')
-        self.progress.grid(row=6, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
+        self.progress.grid(row=8, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        
+        # Progress bar for individual reel creation
+        ttk.Label(main_frame, text="Reel Generation Progress:", font=('Arial', 10, 'bold')).grid(
+            row=9, column=0, sticky=tk.W, pady=(15, 5)
+        )
+        self.reel_progress = ttk.Progressbar(main_frame, mode='determinate')
+        self.reel_progress.grid(row=10, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=5)
+        self.reel_progress_label = ttk.Label(main_frame, text="", font=('Arial', 9))
+        self.reel_progress_label.grid(row=11, column=0, columnspan=3, pady=(5, 15))
         
         # Log area
-        ttk.Label(main_frame, text="Log:").grid(
-            row=7, column=0, sticky=tk.W, pady=(10, 5)
+        ttk.Label(main_frame, text="Processing Log:", font=('Arial', 10, 'bold')).grid(
+            row=12, column=0, sticky=tk.W, pady=(10, 5)
         )
-        self.log_text = tk.Text(main_frame, height=15, width=70)
-        log_scroll = ttk.Scrollbar(main_frame, orient=tk.VERTICAL, command=self.log_text.yview)
+        
+        # Log frame with scrollbar
+        log_frame = ttk.Frame(main_frame)
+        log_frame.grid(row=13, column=0, columnspan=3, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
+        log_frame.columnconfigure(0, weight=1)
+        log_frame.rowconfigure(0, weight=1)
+        
+        self.log_text = tk.Text(log_frame, height=15, width=75, font=('Consolas', 9))
+        log_scroll = ttk.Scrollbar(log_frame, orient=tk.VERTICAL, command=self.log_text.yview)
         self.log_text.configure(yscrollcommand=log_scroll.set)
-        self.log_text.grid(row=8, column=0, columnspan=2, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5)
-        log_scroll.grid(row=8, column=2, sticky=(tk.N, tk.S), pady=5)
+        
+        self.log_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        log_scroll.grid(row=0, column=1, sticky=(tk.N, tk.S))
         
         # Configure row weights
-        main_frame.rowconfigure(8, weight=1)
+        main_frame.rowconfigure(13, weight=1)
         
         # Bind Enter key to generate
         self.root.bind('<Return>', lambda e: self.start_generation())
@@ -435,10 +639,21 @@ class OptimizedApp:
             self.logwrite("❌ Duration and clips must be positive numbers")
             return
         
+        # Clear log
+        self.log_text.delete(1.0, tk.END)
+
+        # Reset generation state
+        self.generation_success = False
+        self.generated_count = 0
+
         # Disable UI
         self.is_processing = True
         self.generate_btn.config(state="disabled")
         self.progress.start()
+
+        # Reset reel progress
+        self.reel_progress['value'] = 0
+        self.reel_progress_label.config(text="Preparing to generate reels...")
         
         # Start processing in background thread
         thread = threading.Thread(
@@ -449,117 +664,188 @@ class OptimizedApp:
         thread.start()
     
     def generate_reels(self, url: str, max_duration: int, max_clips: int, output_dir: str):
-        """Main generation process"""
+        """Main generation process - OpusClip style"""
+        # Reset state
+        self.generation_success = False
+        self.generated_count = 0
+
         try:
-            self.logwrite(f"🚀 Starting generation for: {url}")
-            
+            self.logwrite(f"🚀 Starting OpusClip-style generation for: {url}")
+
+            # Step 1: Extract video ID
+            self.logwrite("🔍 Extracting video ID...")
+            video_id = get_video_id(url)
+            self.logwrite(f"✅ Video ID: {video_id}")
+
+            video_cache_dir = CACHE_DIR / video_id
+            video_cache_dir.mkdir(exist_ok=True)
+
+            video_file = video_cache_dir / "video.mp4"
+            transcription_file = video_cache_dir / "transcription_words.json"
+
             # Create output directory
             outdir = Path(output_dir)
             outdir.mkdir(parents=True, exist_ok=True)
             self.logwrite(f"📁 Output directory: {outdir}")
-            
+
             # Download video
-            self.logwrite("📥 Downloading video...")
-            with tempfile.TemporaryDirectory() as temp_dir:
-                temp_path = Path(temp_dir)
-                video_file = temp_path / "input.mp4"
-                
-                # Configure yt-dlp
+            if not video_file.exists():
+                self.logwrite("📥 Downloading video...")
                 ydl_opts = {
-                    'format': 'best[height<=720]',  # Limit to 720p for performance
+                    'format': 'best[height<=720]',
                     'outtmpl': str(video_file),
                     'quiet': True,
                     'no_warnings': True
                 }
-                
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     ydl.download([url])
-                
-                if not video_file.exists():
-                    raise Exception("Failed to download video")
-                
-                self.logwrite(f"✅ Video downloaded: {video_file.name}")
-                
-                # Initialize model manager
-                model_manager = ModelManager()
-                
-                # Transcribe with streaming
-                segments = transcribe_with_streaming(str(video_file), chunk_duration=30)
-                self.logwrite(f"✅ Transcription complete: {len(segments)} segments")
-                
-                if not segments:
-                    raise Exception("No speech detected in video")
-                
-                # Analyze sentiment
-                with model_manager.get_sentiment_analyzer() as analyzer:
-                    blocks = score_segments(segments, analyzer)
-                
-                self.logwrite(f"✅ Sentiment analysis complete: {len(blocks)} blocks")
-                
-                # Select best segments
-                selected_blocks = select_best_segments(blocks, max_duration, max_clips)
-                self.logwrite(f"✅ Selected {len(selected_blocks)} best segments")
-                
-                if not selected_blocks:
-                    raise Exception("No suitable segments found")
-                
-                # Process each selected segment
-                for i, block in enumerate(selected_blocks):
-                    self.logwrite(f"🎬 Processing clip {i+1}/{len(selected_blocks)}")
-                    
-                    # Create clip
-                    clip_file = temp_path / f"clip_{i+1}.mp4"
-                    cmd = [
-                        "ffmpeg", "-y", "-ss", str(block.start), "-t", str(block.end - block.start),
-                        "-i", str(video_file), "-c", "copy", str(clip_file)
-                    ]
-                    
-                    result = subprocess.run(cmd, capture_output=True, text=True)
-                    if result.returncode != 0:
-                        self.logwrite(f"❌ Clip creation failed: {result.stderr}")
-                        continue
-                    
-                    # Add subtitles
-                    subtitled_file = temp_path / f"subtitled_{i+1}.mp4"
-                    add_subtitles_to_video(str(clip_file), [block], str(subtitled_file))
-                    
-                    # Convert to vertical format
-                    final_file = outdir / f"reel_{i+1}.mp4"
-                    create_vertical_video(str(subtitled_file), str(final_file))
-                    
-                    # Log memory usage
-                    current_memory = MemoryMonitor.get_memory_usage()
-                    self.logwrite(f"💾 Memory: {current_memory:.1f}MB")
-                    
-                    if MemoryMonitor.check_memory_limit():
-                        self.logwrite("⚠️ Memory limit reached, stopping generation")
-                        break
-                
-                self.logwrite(f"🎉 Generation complete! Files saved in: {outdir}")
-                self.logwrite(f"💾 Final memory: {MemoryMonitor.get_memory_usage():.1f}MB")
-                
+                self.logwrite("✅ Video downloaded")
+            else:
+                self.logwrite("✅ Video found in cache")
+
+            # Verify video file exists and has size
+            if not video_file.exists():
+                raise Exception("Video file was not created")
+            if video_file.stat().st_size == 0:
+                raise Exception("Video file is empty")
+            self.logwrite(f"📊 Video file size: {video_file.stat().st_size} bytes")
+
+            # Transcribe with word-level timestamps
+            if not transcription_file.exists():
+                self.logwrite("🎵 Transcribing with word-level timestamps...")
+                segments = transcribe_with_word_timestamps(str(video_file))
+                with open(transcription_file, 'w') as f:
+                    json.dump(segments, f, indent=2)
+                self.logwrite("✅ Transcription complete")
+            else:
+                self.logwrite("✅ Transcription found in cache")
+                with open(transcription_file, 'r') as f:
+                    segments = json.load(f)
+
+            if not segments:
+                raise Exception("No speech detected in video")
+
+            self.logwrite(f"📊 Transcription segments: {len(segments)}")
+
+            # Segment into sentences
+            self.logwrite("📝 Segmenting into sentences...")
+            sentences = segment_into_sentences(segments)
+            self.logwrite(f"✅ Created {len(sentences)} meaningful sentences")
+
+            if not sentences:
+                raise Exception("No meaningful sentences found")
+
+            # Select best sentences
+            self.logwrite("🎯 Selecting best sentences...")
+            selected_sentences = select_best_sentences(sentences, max_duration, max_clips)
+            self.logwrite(f"✅ Selected {len(selected_sentences)} best sentences for reels")
+
+            if not selected_sentences:
+                raise Exception("No suitable sentences found for reel creation")
+
+            # Generate reels
+            total_clips = len(selected_sentences)
+            self.root.after(0, self._update_progress_init, total_clips)
+
+            successful_reels = 0
+            for i, sentence in enumerate(selected_sentences):
+                self.root.after(0, self._update_reel_progress, i + 1, total_clips)
+                self.logwrite(f"🎬 Creating reel {i+1}/{total_clips}: '{sentence.text[:50]}...'")
+
+                # Create temporary directory for this reel
+                with tempfile.TemporaryDirectory() as temp_dir:
+                    temp_path = Path(temp_dir)
+                    final_file = outdir / f"reel_{i+1:02d}.mp4"
+
+                    success = create_reel_from_sentence(
+                        str(video_file), sentence, str(final_file), temp_path, self.logwrite
+                    )
+
+                    if success:
+                        successful_reels += 1
+                        self.logwrite(f"✅ Reel {i+1} created successfully")
+                        # Verify file was actually created
+                        if final_file.exists():
+                            self.logwrite(f"📁 File saved: {final_file} ({final_file.stat().st_size} bytes)")
+                        else:
+                            self.logwrite(f"❌ File not found: {final_file}")
+                    else:
+                        self.logwrite(f"❌ Failed to create reel {i+1}")
+
+                # Memory check
+                current_memory = MemoryMonitor.get_memory_usage()
+                self.logwrite(f"💾 Memory: {current_memory:.1f}MB")
+
+                if MemoryMonitor.check_memory_limit():
+                    self.logwrite("⚠️ Memory limit reached, stopping generation")
+                    break
+
+            self.generated_count = successful_reels
+
+            if successful_reels > 0:
+                self.generation_success = True
+                self.logwrite(f"🎉 Generation complete! Created {successful_reels} reels")
+                self.logwrite(f"📁 Files saved in: {outdir}")
+            else:
+                self.logwrite(f"❌ No reels were successfully created!")
+
         except Exception as e:
             self.logwrite(f"❌ Generation failed: {e}")
             import traceback
             self.logwrite(f"🔍 Error details: {traceback.format_exc()}")
-        
+
         finally:
-            # Final cleanup
-            model_manager.cleanup_all()
+            # Cleanup
             MemoryMonitor.force_cleanup()
-            
-            # Reset UI
             self.is_processing = False
-            self.root.after(0, lambda: [
-                self.generate_btn.config(state="normal"),
-                self.progress.stop()
-            ])
+            self.root.after(0, self._reset_ui)
+    
+    def _update_progress_init(self, total_clips):
+        """Initialize progress bar"""
+        self.reel_progress.config(maximum=total_clips)
+        self.reel_progress['value'] = 0
+    
+    def _update_reel_progress(self, current, total):
+        """Update reel progress bar"""
+        self.reel_progress.config(value=current)
+        self.reel_progress_label.config(text=f"Creating reel {current} of {total}")
+    
+    def _reset_ui(self):
+        """Reset UI after processing"""
+        self.generate_btn.config(state="normal")
+        self.progress.stop()
+        self.reel_progress['value'] = self.reel_progress['maximum']
+
+        # Show appropriate message based on results
+        if self.generation_success and self.generated_count > 0:
+            self.reel_progress_label.config(text=f"✅ {self.generated_count} reels generated successfully! 🎉")
+        elif self.generated_count == 0:
+            self.reel_progress_label.config(text="❌ No reels were created")
+        else:
+            self.reel_progress_label.config(text="⚠️ Generation completed with errors")
 
 if __name__ == '__main__':
-    print("🚀 Starting Viral Reels Generator - Optimized for Mac M1")
+    print("🚀 Starting Viral Reels")
     print(f"💾 System memory: {psutil.virtual_memory().total / 1024**3:.1f}GB")
     print(f"🖥️ CPU cores: {psutil.cpu_count()}")
-    
+
+    # Check if ffmpeg is available
+    try:
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True, timeout=10)
+        if result.returncode == 0:
+            print("✅ FFmpeg is available")
+        else:
+            print("❌ FFmpeg check failed")
+            print("Please install FFmpeg: brew install ffmpeg")
+            exit(1)
+    except FileNotFoundError:
+        print("❌ FFmpeg not found")
+        print("Please install FFmpeg: brew install ffmpeg")
+        exit(1)
+    except subprocess.TimeoutExpired:
+        print("❌ FFmpeg check timed out")
+        exit(1)
+
     root = tk.Tk()
-    app = OptimizedApp(root)
+    app = OpusClipApp(root)
     root.mainloop()

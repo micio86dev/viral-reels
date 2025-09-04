@@ -1,4 +1,4 @@
-# 🎬 Viral Reels Generator - Mac M1 Optimized
+# 🎬 Viral Reels
 
 Turn any YouTube video into viral-ready reels with **AI-powered analysis, synced subtitles, and vertical format output**.  
 This version is specifically optimized for **Mac M1/M2/M3 chips** with improved memory management and performance.
